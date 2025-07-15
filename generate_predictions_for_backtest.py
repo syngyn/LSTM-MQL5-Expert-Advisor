@@ -120,8 +120,9 @@ def generate_predictions():
     predictions_df = pd.DataFrame(all_predictions)
 
     # --- 5. Save to CSV ---
-    print(f"\n[5/5] Saving predictions to '{PREDICTIONS_OUTPUT_FILE}'...")
-    predictions_df.to_csv(PREDICTIONS_OUTPUT_FILE, index=False, float_format='%.8f')
+    # FIX: Added sep=';' to use a semicolon as the separator.
+    print(f"\n[5/5] Saving predictions to '{PREDICTIONS_OUTPUT_FILE}' using SEMICOLON separator...")
+    predictions_df.to_csv(PREDICTIONS_OUTPUT_FILE, index=False, float_format='%.8f', sep=';')
 
     print("\n--- ✓ Generation Complete! ---")
     print(f"You can now run the Strategy Tester. It will read from '{os.path.basename(PREDICTIONS_OUTPUT_FILE)}'.")
