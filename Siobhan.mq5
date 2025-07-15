@@ -6,7 +6,7 @@
 //+------------------------------------------------------------------+
 
 #property copyright "Jason.W.Rusk@gmail.com 2025"
-#property version   "1.42" // FIX: Use FILE_COMMON for backtest predictions
+#property version   "1.43" // FIX: Use semicolon delimiter for backtest CSV
 
 #include <Trade/Trade.mqh>
 #include <Files/File.mqh>
@@ -186,14 +186,12 @@ bool LoadBacktestPredictions()
    ArrayFree(g_backtest_predictions);
    g_backtest_prediction_idx = 0;
 
-   // FIX: Added the FILE_COMMON flag to look in the shared terminal folder
    if(!FileIsExist(BACKTEST_PREDICTIONS_FILE, FILE_COMMON))
      {
       PrintFormat("FATAL ERROR: Backtest predictions file not found in Common/Files folder! Please place it there. File searched: %s", BACKTEST_PREDICTIONS_FILE);
       return false;
      }
 
-   // FIX: Added the FILE_COMMON flag here as well
    int file_handle = FileOpen(BACKTEST_PREDICTIONS_FILE, FILE_READ | FILE_CSV | FILE_ANSI | FILE_COMMON);
    if(file_handle == INVALID_HANDLE)
      {
@@ -208,7 +206,8 @@ bool LoadBacktestPredictions()
      {
       string line_parts[];
       string line = FileReadString(file_handle);
-      if(StringSplit(line, ',', line_parts) < 4 + PREDICTION_STEPS)
+      // FIX: Use semicolon as the delimiter to avoid issues with decimal commas
+      if(StringSplit(line, ';', line_parts) < 4 + PREDICTION_STEPS)
          continue;
 
       ArrayResize(g_backtest_predictions, count + 1);
@@ -240,7 +239,6 @@ bool FindPredictionForBar(datetime bar_time, BacktestPrediction &found_pred)
         }
       if(g_backtest_predictions[i].timestamp > bar_time)
         {
-         // We've gone past the time, no need to search further
          return false;
         }
      }
@@ -485,7 +483,7 @@ void ManageTrailingStop()
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   Print("=== Siobhan EA v1.42 (Backtest Enabled & Fixed) Initializing ===");
+   Print("=== Siobhan EA v1.43 (Backtest Enabled & Fixed) Initializing ===");
    
    InitializeParameters();
 
