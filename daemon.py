@@ -1,4 +1,4 @@
-mport os
+import os
 import json
 import time
 import torch
@@ -31,6 +31,7 @@ print(f"--> Using Model Path: {MODEL_DIR}")
 print(f"--> Using Communication Path: {DATA_DIR}")
 
 # --- Model File Paths ---
+MODEL_FILE_CLASSIFICATION = os.path.join(MODEL_DIR, "lstm_model.pth")
 SCALER_FILE_FEATURE = os.path.join(MODEL_DIR, "scaler.pkl")
 MODEL_FILE_REGRESSION = os.path.join(MODEL_DIR, "lstm_model_regression.pth")
 SCALER_FILE_REGRESSION_TARGET = os.path.join(MODEL_DIR, "scaler_regression.pkl")
@@ -40,8 +41,17 @@ INPUT_FEATURES = 15
 HIDDEN_SIZE, NUM_LAYERS, SEQ_LEN = 128, 2, 20
 POLL_INTERVAL = 0.1
 OUTPUT_STEPS = 24
+NUM_CLASSES = 3
 
-# --- Model Definition ---
+# --- Model Definitions ---
+class LSTMClassifier(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_classes):
+        super(LSTMClassifier, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2 if num_layers > 1 else 0)
+        self.fc = nn.Linear(hidden_size, num_classes)
+    def forward(self, x):
+        out, _ = self.lstm(x); out = out[:, -1, :]; return self.fc(out)
+
 class LSTMRegressor(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_steps):
         super(LSTMRegressor, self).__init__()
@@ -54,23 +64,36 @@ class LSTMRegressor(nn.Module):
 class LSTMDaemon:
     def __init__(self):
         self.device = torch.device("cpu")
-        self.model_regressor, self.scaler_feature, self.scaler_regressor_target = None, None, None
+        self.model_classifier = None
+        self.model_regressor = None
+        self.scaler_feature = None
+        self.scaler_regressor_target = None
         self._load_models()
 
     def _load_models(self):
-        print("Loading models and scalers...")
+        print("Loading all models and scalers...")
         try:
+            # Load shared feature scaler first
             self.scaler_feature = joblib.load(SCALER_FILE_FEATURE)
             print(f"✓ Feature scaler loaded successfully.")
             
+            # Load Classification Model
+            self.model_classifier = LSTMClassifier(INPUT_FEATURES, HIDDEN_SIZE, NUM_LAYERS, NUM_CLASSES)
+            checkpoint_c = torch.load(MODEL_FILE_CLASSIFICATION, map_location=self.device)
+            self.model_classifier.load_state_dict(checkpoint_c['model_state'])
+            self.model_classifier.to(self.device).eval()
+            print(f"✓ LSTM classification model loaded successfully.")
+
+            # Load Regression Model
             self.model_regressor = LSTMRegressor(INPUT_FEATURES, HIDDEN_SIZE, NUM_LAYERS, OUTPUT_STEPS)
             checkpoint_r = torch.load(MODEL_FILE_REGRESSION, map_location=self.device)
             self.model_regressor.load_state_dict(checkpoint_r['model_state'])
             self.model_regressor.to(self.device).eval()
             self.scaler_regressor_target = joblib.load(SCALER_FILE_REGRESSION_TARGET)
             print(f"✓ LSTM regression model and target scaler loaded successfully.")
+
         except Exception as e:
-            print(f"FATAL: Could not load models/scalers: {e}. The daemon cannot run.")
+            print(f"FATAL: Could not load one or more models/scalers: {e}. The daemon cannot run.")
             traceback.print_exc()
             sys.exit(1)
 
@@ -90,6 +113,21 @@ class LSTMDaemon:
         predicted_std_dev = np.std(price_changes)
         confidence = predicted_std_dev / atr
         return np.clip(confidence, 0.0, 2.0) / 2.0
+
+    def _get_classification_prediction(self, features: list) -> tuple:
+        if not all([self.model_classifier, self.scaler_feature]):
+            raise RuntimeError("Classification model or feature scaler is not loaded.")
+        
+        arr = np.array(features, dtype=np.float32).reshape(1, SEQ_LEN, INPUT_FEATURES)
+        scaled_features = self.scaler_feature.transform(arr.reshape(-1, INPUT_FEATURES))
+        scaled_sequence = scaled_features.reshape(1, SEQ_LEN, INPUT_FEATURES)
+        tensor = torch.tensor(scaled_sequence, dtype=torch.float32).to(self.device)
+        
+        with torch.no_grad():
+            logits = self.model_classifier(tensor)
+            probabilities = torch.softmax(logits, dim=1)[0]
+            # Order: Sell (0), Hold (1), Buy (2)
+            return probabilities[0].item(), probabilities[1].item(), probabilities[2].item()
 
     def _get_regression_prediction(self, features: list, current_price: float, atr: float) -> dict:
         if not all([self.model_regressor, self.scaler_feature, self.scaler_regressor_target]):
@@ -119,13 +157,15 @@ class LSTMDaemon:
             request_id = data.get("request_id", os.path.basename(filepath))
             action = data.get("action")
             features = data.get("features")
-            current_price = data.get("current_price")
-            atr = data.get("atr")
-
-            if not all([action, features, isinstance(current_price, float), isinstance(atr, float)]):
-                raise ValueError("Request JSON missing/invalid keys (action, features, current_price, atr).")
+            
+            if not all([action, features]):
+                raise ValueError("Request JSON missing 'action' or 'features'.")
 
             if action == "predict_regression":
+                current_price = data.get("current_price")
+                atr = data.get("atr")
+                if not all([isinstance(current_price, float), isinstance(atr, float)]):
+                     raise ValueError("Regression request missing 'current_price' or 'atr'.")
                 prediction_result = self._get_regression_prediction(features, current_price, atr)
                 response = {
                     "request_id": request_id,
@@ -133,7 +173,16 @@ class LSTMDaemon:
                     "predicted_prices": prediction_result["predicted_prices"],
                     "confidence_score": prediction_result["confidence_score"]
                 }
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ Responded to {request_id} (Conf: {prediction_result['confidence_score']:.2f})")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ Responded to {request_id} (Regression - Conf: {prediction_result['confidence_score']:.2f})")
+            
+            elif action == "predict_classification":
+                sell_prob, hold_prob, buy_prob = self._get_classification_prediction(features)
+                response = {
+                    "request_id": request_id, "status": "success",
+                    "sell_probability": sell_prob, "hold_probability": hold_prob, "buy_probability": buy_prob
+                }
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✓ Responded to {request_id} (Classification)")
+
             else:
                 raise ValueError(f"Unknown action: '{action}'")
 
@@ -147,7 +196,7 @@ class LSTMDaemon:
         os.rename(resp_path_tmp, resp_path_final)
 
     def run(self):
-        print("\n--- Advanced LSTM Daemon is running. ---")
+        print("\n--- Advanced Dual-Mode LSTM Daemon is running. ---")
         while True:
             try:
                 for fname in os.listdir(DATA_DIR):

@@ -7,7 +7,21 @@ import pandas as pd
 from datetime import datetime
 from pykalman import KalmanFilter
 
+# --- NEW: Added missing torch imports ---
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+# --- END OF FIX ---
+
 from data_processing import load_and_align_data, create_features
+
+# --- Model Definitions (Copied from training scripts) ---
+class LSTMClassifier(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_classes):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2 if num_layers > 1 else 0)
+        self.fc = nn.Linear(hidden_size, num_classes)
+    def forward(self, x):
+        out, _ = self.lstm(x); out = out[:, -1, :]; return self.fc(out)
 
 class LSTMRegressor(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_steps):
@@ -36,6 +50,7 @@ OUTPUT_FILE_LOCAL = os.path.join(SCRIPT_DIR, 'backtest_predictions.csv')
 # --- Model Hyperparameters ---
 INPUT_FEATURES, HIDDEN_SIZE, NUM_LAYERS, SEQ_LEN = 15, 128, 2, 20
 OUTPUT_STEPS = 24
+NUM_CLASSES = 3
 
 # --- Data File Configuration ---
 REQUIRED_FILES = {
@@ -62,10 +77,17 @@ def generate_predictions():
     print("Loading models and scalers...")
     try:
         device = torch.device("cpu")
+        
+        model_classifier = LSTMClassifier(INPUT_FEATURES, HIDDEN_SIZE, NUM_LAYERS, NUM_CLASSES).to(device)
+        checkpoint_c = torch.load(os.path.join(MODEL_DIR, "lstm_model.pth"), map_location=device)
+        model_classifier.load_state_dict(checkpoint_c['model_state'])
+        model_classifier.eval()
+
         model_regressor = LSTMRegressor(INPUT_FEATURES, HIDDEN_SIZE, NUM_LAYERS, OUTPUT_STEPS).to(device)
         checkpoint_r = torch.load(os.path.join(MODEL_DIR, "lstm_model_regression.pth"), map_location=device)
         model_regressor.load_state_dict(checkpoint_r['model_state'])
         model_regressor.eval()
+
         scaler_feature = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
         scaler_target = joblib.load(os.path.join(MODEL_DIR, "scaler_regression.pkl"))
         print("✓ Models and scalers loaded.")
@@ -87,7 +109,12 @@ def generate_predictions():
 
     print("Generating predictions...")
     with torch.no_grad():
+        # Classification
+        logits = model_classifier(X_tensor)
+        probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+        # Regression
         scaled_regr_preds = model_regressor(X_tensor).cpu().numpy()
+        
     unscaled_regr_preds = scaler_target.inverse_transform(scaled_regr_preds)
     print("✓ Predictions generated.")
 
@@ -99,7 +126,7 @@ def generate_predictions():
         idx = y_indices[i]
         timestamp = main_df.index[idx].strftime('%Y.%m.%d %H:%M:%S')
         
-        buy_prob, sell_prob, hold_prob = 0.5, 0.5, 0.0 # Placeholder
+        sell_prob, hold_prob, buy_prob = probabilities[i][0], probabilities[i][1], probabilities[i][2]
         
         raw_prices = unscaled_regr_preds[i]
         smoothed_prices = apply_kalman_filter(raw_prices)
